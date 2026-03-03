@@ -14,3 +14,15 @@ wheels/
 *api_key*
 # Databases
 *.db
+
+# Data files
+*.csv
+
+# Agent folder - Commit only Skill documentation
+.agent/**
+!.agent/skills/
+!.agent/skills/**/
+!.agent/skills/**/SKILL.md
+
+# Tools
+backdate.py

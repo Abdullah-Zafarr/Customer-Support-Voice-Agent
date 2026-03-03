@@ -46,7 +46,9 @@ async def setup_stt(on_transcript_callback):
         return dg_connection
 
     except Exception as e:
+        import traceback
         logger.error(f"Error setting up Deepgram: {e}")
+        logger.error(traceback.format_exc())
         return None
 
 async def get_tts_stream(text: str):
