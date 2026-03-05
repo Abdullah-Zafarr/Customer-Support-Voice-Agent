@@ -6,18 +6,17 @@ and Text-to-Speech using Microsoft Edge TTS.
 
 import asyncio
 import io
-import struct
 import tempfile
 import os
 import wave
 import numpy as np
 from faster_whisper import WhisperModel
 import edge_tts
+import av
 
 from .logger import logger
 
 # ─── WHISPER MODEL (loaded once at startup) ───
-# Using "tiny" for lowest latency on CPU. Options: tiny, base, small, medium, large-v3
 _whisper_model = None
 
 def get_whisper_model():
@@ -34,10 +33,10 @@ def get_whisper_model():
 
 
 # ─── VOICE ACTIVITY DETECTION (energy-based) ───
-SILENCE_THRESHOLD = 500       # RMS energy below this = silence
-SILENCE_DURATION_MS = 400     # Reduced from 800ms for faster response
+SILENCE_THRESHOLD = 500
+SILENCE_DURATION_MS = 400
 SAMPLE_RATE = 16000
-BYTES_PER_SAMPLE = 2          # 16-bit PCM
+BYTES_PER_SAMPLE = 2
 
 
 class AudioBuffer:
@@ -49,12 +48,10 @@ class AudioBuffer:
         self.has_speech = False
         self.on_speech_complete = on_speech_complete_callback
         self._lock = asyncio.Lock()
-        # How many bytes of silence correspond to SILENCE_DURATION_MS
         self._silence_bytes_threshold = int(SAMPLE_RATE * BYTES_PER_SAMPLE * SILENCE_DURATION_MS / 1000)
         self._silence_accumulated = 0
 
     def _compute_rms(self, pcm_bytes: bytes) -> float:
-        """Compute RMS energy of a PCM16 chunk."""
         if len(pcm_bytes) < 2:
             return 0.0
         samples = np.frombuffer(pcm_bytes, dtype=np.int16)
@@ -63,32 +60,25 @@ class AudioBuffer:
         return float(np.sqrt(np.mean(samples.astype(np.float32) ** 2)))
 
     async def add_chunk(self, chunk: bytes):
-        """Add an audio chunk. If speech-then-silence is detected, trigger transcription."""
         async with self._lock:
             self.buffer.extend(chunk)
             rms = self._compute_rms(chunk)
 
             if rms > SILENCE_THRESHOLD:
-                # Speech detected
                 self.has_speech = True
                 self._silence_accumulated = 0
             else:
-                # Silence
                 self._silence_accumulated += len(chunk)
 
-            # If we had speech and now enough silence, trigger transcription
             if self.has_speech and self._silence_accumulated >= self._silence_bytes_threshold:
                 audio_data = bytes(self.buffer)
                 self.buffer = bytearray()
                 self.has_speech = False
                 self._silence_accumulated = 0
-                # Fire transcription in background
                 asyncio.create_task(self._transcribe(audio_data))
 
     async def _transcribe(self, pcm_bytes: bytes):
-        """Transcribe accumulated audio using Whisper."""
         try:
-            # Convert PCM16 to WAV in memory
             wav_buffer = io.BytesIO()
             with wave.open(wav_buffer, 'wb') as wav_file:
                 wav_file.setnchannels(1)
@@ -97,7 +87,6 @@ class AudioBuffer:
                 wav_file.writeframes(pcm_bytes)
             wav_buffer.seek(0)
 
-            # Run Whisper transcription in a thread to not block the event loop
             loop = asyncio.get_event_loop()
             transcript = await loop.run_in_executor(None, self._run_whisper, wav_buffer)
 
@@ -108,10 +97,8 @@ class AudioBuffer:
             logger.error(f"Whisper transcription error: {e}")
 
     def _run_whisper(self, wav_buffer: io.BytesIO) -> str:
-        """Synchronous Whisper transcription (runs in thread pool)."""
         model = get_whisper_model()
 
-        # Write to temp file since faster-whisper needs file path or numpy array
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp.write(wav_buffer.read())
             tmp_path = tmp.name
@@ -139,7 +126,6 @@ class AudioBuffer:
 
 async def setup_stt(on_transcript_callback):
     """Setup Whisper-based STT. Returns an AudioBuffer that accepts raw PCM16 chunks."""
-    # Pre-load the model
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, get_whisper_model)
 
@@ -148,61 +134,64 @@ async def setup_stt(on_transcript_callback):
     return audio_buffer
 
 
+# ─── TTS: Edge TTS → PCM16 chunks ───
+TTS_SAMPLE_RATE = 24000
+TTS_CHUNK_DURATION_MS = 100  # 100ms per chunk for smooth streaming
+TTS_CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * TTS_CHUNK_DURATION_MS / 1000)
+TTS_CHUNK_BYTES = TTS_CHUNK_SAMPLES * 2  # 16-bit = 2 bytes per sample
+
+
+def _convert_mp3_to_pcm(mp3_bytes: bytes) -> bytes:
+    """Convert MP3 bytes to raw PCM16 mono 24kHz using PyAV. Runs in thread pool."""
+    input_buf = io.BytesIO(mp3_bytes)
+    output_buf = io.BytesIO()
+
+    container = av.open(input_buf, mode='r')
+    resampler = av.AudioResampler(
+        format='s16',
+        layout='mono',
+        rate=TTS_SAMPLE_RATE,
+    )
+
+    for frame in container.decode(audio=0):
+        resampled = resampler.resample(frame)
+        for rf in resampled:
+            output_buf.write(rf.to_ndarray().tobytes())
+
+    container.close()
+    return output_buf.getvalue()
+
+
 async def get_tts_stream(text: str):
-    """Stream TTS audio, converting Edge TTS MP3 to raw PCM16 on the fly for instant playback."""
-    import av
-    
+    """Generate TTS audio: collect MP3 from Edge TTS, convert to PCM16, stream in chunks."""
     try:
         communicate = edge_tts.Communicate(
             text,
             voice="en-US-AriaNeural",
         )
 
-        # Buffer to feed MP3 data into PyAV
-        mp3_buffer = io.BytesIO()
-        
-        # Setup PyAV to decode MP3 from the buffer and reformat to PCM16 at 24kHz
-        container = None
-        resampler = av.AudioResampler(
-            format='s16',
-            layout='mono',
-            rate=24000,
-        )
-
+        # Step 1: Collect full MP3 from Edge TTS
+        mp3_chunks = []
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
-                # Write chunk to buffer and seek back
-                current_pos = mp3_buffer.tell()
-                mp3_buffer.write(chunk["data"])
-                mp3_buffer.seek(current_pos)
-                
-                # If this is the first chunk, open the container
-                if container is None:
-                    try:
-                        container = av.open(mp3_buffer, mode='r')
-                        stream = container.streams.audio[0]
-                    except av.AVError:
-                        continue # Wait for more data if header is incomplete
+                mp3_chunks.append(chunk["data"])
 
-                # Decode frames from the stream
-                try:
-                    for frame in container.decode(stream):
-                        resampled_frames = resampler.resample(frame)
-                        for resampled_frame in resampled_frames:
-                            yield resampled_frame.to_ndarray().tobytes()
-                except (av.AVError, EOFError):
-                    continue
+        if not mp3_chunks:
+            logger.warning("Edge TTS returned no audio data.")
+            return
 
-        # Flush decoder at the end
-        if container:
-            try:
-                for frame in container.decode(stream):
-                    resampled_frames = resampler.resample(frame)
-                    for resampled_frame in resampled_frames:
-                        yield resampled_frame.to_ndarray().tobytes()
-                container.close()
-            except:
-                pass
+        mp3_data = b"".join(mp3_chunks)
+
+        # Step 2: Convert MP3 → PCM16 in a thread
+        loop = asyncio.get_event_loop()
+        pcm_data = await loop.run_in_executor(None, _convert_mp3_to_pcm, mp3_data)
+
+        # Step 3: Stream in fixed-size chunks for smooth playback
+        offset = 0
+        while offset < len(pcm_data):
+            chunk = pcm_data[offset:offset + TTS_CHUNK_BYTES]
+            yield chunk
+            offset += TTS_CHUNK_BYTES
 
     except Exception as e:
-        logger.error(f"Error in streaming TTS conversion: {e}")
+        logger.error(f"Error in TTS pipeline: {e}")
