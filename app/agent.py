@@ -1,52 +1,52 @@
 import json
 from groq import AsyncGroq
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 from .config import settings
 from .logger import logger
-from .database import SessionLocal, Appointment
+from .database import SessionLocal, SupportTicket
 
 # Initialize AsyncGroq client
 groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
-MODEL = "llama-3.3-70b-versatile" # Lighting fast Groq model
+MODEL = "llama-3.3-70b-versatile"
 
-SYSTEM_PROMPT = """You are an AI Voice Agent for a home services company (HVAC and Plumbing).
-Your goal is to briefly chat with the customer, understand their issue, and book an appointment for them.
-Be highly conversational, brief, and concise as you are speaking over the phone.
-Ask ONE question at a time.
-First, ask for their name.
-Then, ask for a brief description of their issue.
-Once you have the name and issue, use the `book_appointment` tool to schedule an appointment.
+SYSTEM_PROMPT = """You are a professional AI Customer Support Agent.
+Your job is to greet the caller, understand their issue, and log a support ticket.
+Be warm, conversational, and efficient — you're speaking over the phone.
+Ask ONE question at a time. Keep responses under 2 sentences.
 
-Do NOT provide long explanations. Keep responses under 2-3 sentences max.
+Flow:
+1. Greet the caller and ask for their name.
+2. Ask them to describe their issue briefly.
+3. Once you have both, use the `create_ticket` tool to log the ticket.
+4. Confirm the ticket was created and ask if there's anything else.
+
+Never give long explanations. Be concise and helpful.
 """
 
-def book_appointment_db(name: str, issue: str, urgency: str) -> dict:
-    """Mock database operation to book an appointment."""
+def create_ticket_db(name: str, issue: str, urgency: str) -> dict:
+    """Create a support ticket in the database."""
     db = SessionLocal()
     try:
-        # Simple scheduling logic: book for tomorrow
-        scheduled_time = datetime.now() + timedelta(days=1)
-        
-        new_app = Appointment(
+        new_ticket = SupportTicket(
             customer_name=name,
             issue_description=issue,
             urgency=urgency,
-            scheduled_time=scheduled_time
+            created_at=datetime.now()
         )
-        db.add(new_app)
+        db.add(new_ticket)
         db.commit()
-        db.refresh(new_app)
+        db.refresh(new_ticket)
         
         return {
             "status": "success",
-            "appointment_id": new_app.id,
-            "scheduled_time": scheduled_time.isoformat(),
-            "message": f"Appointment booked for {name} regarding {issue}."
+            "ticket_id": new_ticket.id,
+            "created_at": new_ticket.created_at.isoformat(),
+            "message": f"Support ticket #{new_ticket.id} created for {name}."
         }
     except Exception as e:
-        logger.error(f"Failed to book appointment: {e}")
+        logger.error(f"Failed to create ticket: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
@@ -56,8 +56,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "book_appointment",
-            "description": "Book a service appointment for a customer.",
+            "name": "create_ticket",
+            "description": "Create a customer support ticket to log the caller's issue.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -67,12 +67,12 @@ TOOLS = [
                     },
                     "issue": {
                         "type": "string",
-                        "description": "A brief description of the plumbing or HVAC issue."
+                        "description": "A brief description of the customer's issue or request."
                     },
                     "urgency": {
                         "type": "string",
                         "enum": ["low", "medium", "high", "emergency"],
-                        "description": "The estimated urgency of the issue."
+                        "description": "The estimated urgency level of the issue."
                     }
                 },
                 "required": ["name", "issue", "urgency"]
@@ -103,35 +103,32 @@ async def process_llm_turn(messages: List[Dict[str, Any]]) -> dict:
         # Check if LLM wants to call a function
         tool_calls = response_message.tool_calls
         if tool_calls:
-            messages.append(response_message) # Add assistant's tool call request
+            messages.append(response_message)
             tool_calls_info = []
             
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
                 
-                if function_name == "book_appointment":
+                if function_name == "create_ticket":
                     function_args = json.loads(tool_call.function.arguments)
                     logger.info(f"LLM called tool {function_name} with args: {function_args}")
                     
-                    # Execute the function
-                    function_response = book_appointment_db(
+                    function_response = create_ticket_db(
                         name=function_args.get("name"),
                         issue=function_args.get("issue"),
                         urgency=function_args.get("urgency", "medium")
                     )
                     
-                    # Store info for frontend
                     tool_calls_info.append({
                         "name": function_name,
                         "result": {
                             "name": function_args.get("name"),
                             "issue": function_args.get("issue"),
                             "urgency": function_args.get("urgency", "medium"),
-                            "id": function_response.get("appointment_id")
+                            "id": function_response.get("ticket_id")
                         }
                     })
                     
-                    # Push the result back to messages
                     messages.append({
                         "tool_call_id": tool_call.id,
                         "role": "tool",
