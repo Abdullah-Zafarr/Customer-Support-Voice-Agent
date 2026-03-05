@@ -26,3 +26,12 @@ wheels/
 
 # Tools
 backdate.py
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
