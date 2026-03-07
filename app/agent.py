@@ -12,23 +12,50 @@ groq_client = AsyncGroq(api_key=settings.GROQ_API_KEY)
 MODEL = "llama-3.3-70b-versatile"
 
 SYSTEM_PROMPT = """You are a professional AI Customer Support Agent.
-Your job is to greet the caller, understand their issue, and log a support ticket.
+Your job is to greet the caller, understand their issue, and log/update a support ticket.
 Be warm, conversational, and efficient — you're speaking over the phone.
 Ask ONE question at a time. Keep responses under 2 sentences.
+
+IMPORTANT RULES:
+- Do NOT create a ticket until you have BOTH the customer's name AND a description of their issue.
+- If you only have the name, ask for the issue first. Never create a ticket with an empty issue.
 
 Flow:
 1. Greet the caller and ask for their name.
 2. Ask them to describe their issue briefly.
-3. Once you have both, use the `create_ticket` tool to log the ticket.
-4. Confirm the ticket was created and ask if there's anything else.
+3. ONLY after you have both name AND issue, use the `manage_ticket` tool to log the ticket.
+4. If they give more information later, use the `manage_ticket` tool AGAIN with the same `ticket_id` to update the existing ticket. Do NOT create a new ticket.
+5. Confirm the ticket was created/updated and ask if there's anything else.
 
 Never give long explanations. Be concise and helpful.
 """
 
-def create_ticket_db(name: str, issue: str, urgency: str) -> dict:
-    """Create a support ticket in the database."""
+def manage_ticket_db(name: str, issue: str, urgency: str, ticket_id: Optional[int] = None) -> dict:
+    """Create or update a support ticket in the database."""
+    # Guard: reject tickets with no issue description
+    if not issue or not issue.strip():
+        return {
+            "status": "rejected",
+            "message": "Cannot create a ticket without an issue description. Please ask the customer for their issue first."
+        }
+    
     db = SessionLocal()
     try:
+        if ticket_id:
+            ticket = db.query(SupportTicket).filter(SupportTicket.id == ticket_id).first()
+            if ticket:
+                ticket.customer_name = name
+                ticket.issue_description = issue
+                ticket.urgency = urgency
+                db.commit()
+                db.refresh(ticket)
+                return {
+                    "status": "success",
+                    "action": "updated",
+                    "ticket_id": ticket.id,
+                    "message": f"Support ticket #{ticket.id} updated."
+                }
+                
         new_ticket = SupportTicket(
             customer_name=name,
             issue_description=issue,
@@ -41,12 +68,13 @@ def create_ticket_db(name: str, issue: str, urgency: str) -> dict:
         
         return {
             "status": "success",
+            "action": "created",
             "ticket_id": new_ticket.id,
             "created_at": new_ticket.created_at.isoformat(),
             "message": f"Support ticket #{new_ticket.id} created for {name}."
         }
     except Exception as e:
-        logger.error(f"Failed to create ticket: {e}")
+        logger.error(f"Failed to manage ticket: {e}")
         return {"status": "error", "message": str(e)}
     finally:
         db.close()
@@ -56,8 +84,8 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "create_ticket",
-            "description": "Create a customer support ticket to log the caller's issue.",
+            "name": "manage_ticket",
+            "description": "Create or update a customer support ticket to log the caller's issue.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -67,12 +95,16 @@ TOOLS = [
                     },
                     "issue": {
                         "type": "string",
-                        "description": "A brief description of the customer's issue or request."
+                        "description": "A comprehensive description of the customer's issue. Include accumulated details."
                     },
                     "urgency": {
                         "type": "string",
                         "enum": ["low", "medium", "high", "emergency"],
                         "description": "The estimated urgency level of the issue."
+                    },
+                    "ticket_id": {
+                        "type": "integer",
+                        "description": "The ID of an existing ticket to update (if you have already created one in this conversation)."
                     }
                 },
                 "required": ["name", "issue", "urgency"]
@@ -109,14 +141,15 @@ async def process_llm_turn(messages: List[Dict[str, Any]]) -> dict:
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
                 
-                if function_name == "create_ticket":
+                if function_name == "manage_ticket":
                     function_args = json.loads(tool_call.function.arguments)
                     logger.info(f"LLM called tool {function_name} with args: {function_args}")
                     
-                    function_response = create_ticket_db(
+                    function_response = manage_ticket_db(
                         name=function_args.get("name"),
                         issue=function_args.get("issue"),
-                        urgency=function_args.get("urgency", "medium")
+                        urgency=function_args.get("urgency", "medium"),
+                        ticket_id=function_args.get("ticket_id")
                     )
                     
                     tool_calls_info.append({
