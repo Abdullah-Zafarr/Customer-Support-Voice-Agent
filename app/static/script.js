@@ -234,60 +234,61 @@ function addTranscript(type, text) {
 
     // Make user transcript lines editable on click
     if (type === 'user') {
-        textSpan.style.cursor = 'pointer';
-        textSpan.title = 'Click to edit';
-        textSpan.classList.add('hover:underline', 'hover:decoration-hud-cyan/40');
+        function makeEditable(span) {
+            span.style.cursor = 'pointer';
+            span.title = 'Click to edit — press Enter to submit';
+            span.classList.add('hover:underline', 'hover:decoration-hud-cyan/40');
 
-        textSpan.addEventListener('click', () => {
-            if (line.querySelector('input')) return; // Already editing
+            span.addEventListener('click', () => {
+                if (line.querySelector('input')) return;
 
-            const input = document.createElement('input');
-            input.type = 'text';
-            input.value = textSpan.textContent;
-            input.className = 'bg-transparent border border-hud-cyan/40 text-text-primary font-body text-sm px-1 py-0.5 rounded w-full outline-none focus:border-hud-cyan';
-            input.style.minWidth = '120px';
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.value = span.textContent;
+                input.className = 'bg-transparent border border-hud-cyan/40 text-text-primary font-body text-sm px-1 py-0.5 rounded w-full outline-none focus:border-hud-cyan';
+                input.style.minWidth = '120px';
 
-            const originalText = textSpan.textContent;
-            textSpan.replaceWith(input);
-            input.focus();
-            input.select();
+                const originalText = span.textContent;
+                span.replaceWith(input);
+                input.focus();
+                input.select();
 
-            const finishEdit = (submit) => {
-                const newText = input.value.trim();
-                const finalText = submit && newText ? newText : originalText;
+                let handled = false;
 
-                const newSpan = document.createElement('span');
-                newSpan.className = 'font-body text-sm text-text-primary';
-                newSpan.style.cursor = 'pointer';
-                newSpan.title = 'Click to edit';
-                newSpan.classList.add('hover:underline', 'hover:decoration-hud-cyan/40');
-                newSpan.textContent = finalText;
+                const finishEdit = (submit) => {
+                    if (handled) return;
+                    handled = true;
 
-                input.replaceWith(newSpan);
+                    const newText = input.value.trim();
+                    const finalText = submit && newText ? newText : originalText;
 
-                // Re-attach click handler
-                newSpan.addEventListener('click', () => {
-                    textSpan = newSpan;
-                    textSpan.click();
+                    const newSpan = document.createElement('span');
+                    newSpan.className = 'font-body text-sm text-text-primary';
+                    newSpan.textContent = finalText;
+                    input.replaceWith(newSpan);
+
+                    // Re-attach editing to the new span
+                    makeEditable(newSpan);
+
+                    // If text changed, send correction to server
+                    if (submit && newText && newText !== originalText && ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'correction',
+                            original: originalText,
+                            corrected: newText
+                        }));
+                        addTranscript('system', `✏️ Correction sent: "${newText}"`);
+                    }
+                };
+
+                input.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') { e.preventDefault(); finishEdit(true); }
+                    if (e.key === 'Escape') { e.preventDefault(); finishEdit(false); }
                 });
-
-                // If text was changed, send correction to server
-                if (submit && newText && newText !== originalText && ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({
-                        type: 'correction',
-                        original: originalText,
-                        corrected: newText
-                    }));
-                    addTranscript('system', `✏️ Correction sent: "${newText}"`);
-                }
-            };
-
-            input.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') { e.preventDefault(); finishEdit(true); }
-                if (e.key === 'Escape') { e.preventDefault(); finishEdit(false); }
+                input.addEventListener('blur', () => finishEdit(false));
             });
-            input.addEventListener('blur', () => finishEdit(false));
-        });
+        }
+        makeEditable(textSpan);
     }
 
     transcriptContainer.appendChild(line);
