@@ -97,13 +97,16 @@ async def websocket_endpoint(websocket: WebSocket):
                     corrected = text_msg.get("corrected", "").strip()
                     original = text_msg.get("original", "").strip()
                     if corrected and original:
-                        # Replace the last matching user message with the corrected text
+                        # Find the message and truncate everything after it
                         for i in range(len(messages) - 1, -1, -1):
                             if messages[i].get("role") == "user" and messages[i].get("content") == original:
                                 messages[i]["content"] = corrected
-                                logger.info(f"Transcript corrected: '{original}' → '{corrected}'")
+                                # Truncate history after this message so LLM starts fresh from this point
+                                del messages[i+1:] 
+                                logger.info(f"Transcript corrected: '{original}' → '{corrected}' (History truncated)")
                                 break
-                        # Re-process with corrected text
+                        
+                        # Re-process from the corrected point
                         if tts_task and not tts_task.done():
                             tts_task.cancel()
                             await websocket.send_json({"type": "clear_audio"})
