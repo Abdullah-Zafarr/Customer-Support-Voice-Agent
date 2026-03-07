@@ -22,9 +22,9 @@ _whisper_model = None
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
-        logger.info("Loading Whisper model (tiny.en) — first load may take a moment...")
+        logger.info("Loading Whisper model (small.en) — first load may take a moment to download...")
         _whisper_model = WhisperModel(
-            "tiny.en",
+            "small.en",
             device="cpu",
             compute_type="int8",
         )
@@ -34,7 +34,7 @@ def get_whisper_model():
 
 # ─── VOICE ACTIVITY DETECTION (energy-based) ───
 SILENCE_THRESHOLD = 500
-SILENCE_DURATION_MS = 400
+SILENCE_DURATION_MS = 800
 SAMPLE_RATE = 16000
 BYTES_PER_SAMPLE = 2
 
@@ -112,7 +112,7 @@ class AudioBuffer:
                 vad_filter=True,
                 vad_parameters=dict(
                     min_silence_duration_ms=500,
-                    speech_pad_ms=200,
+                    speech_pad_ms=400,
                 ),
             )
             text = " ".join(segment.text for segment in segments)
@@ -162,36 +162,48 @@ def _convert_mp3_to_pcm(mp3_bytes: bytes) -> bytes:
     return output_buf.getvalue()
 
 
+import re
+
+def _split_into_sentences(text: str) -> list:
+    """Split text into sentences for incremental TTS streaming."""
+    sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s for s in sentences if s.strip()]
+
+
 async def get_tts_stream(text: str):
-    """Generate TTS audio: collect MP3 from Edge TTS, convert to PCM16, stream in chunks."""
+    """Generate TTS audio sentence-by-sentence for low-latency streaming."""
     try:
-        communicate = edge_tts.Communicate(
-            text,
-            voice="en-US-AriaNeural",
-        )
-
-        # Step 1: Collect full MP3 from Edge TTS
-        mp3_chunks = []
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_chunks.append(chunk["data"])
-
-        if not mp3_chunks:
-            logger.warning("Edge TTS returned no audio data.")
+        sentences = _split_into_sentences(text)
+        if not sentences:
             return
 
-        mp3_data = b"".join(mp3_chunks)
+        for sentence in sentences:
+            communicate = edge_tts.Communicate(
+                sentence,
+                voice="en-US-GuyNeural",
+            )
 
-        # Step 2: Convert MP3 → PCM16 in a thread
-        loop = asyncio.get_event_loop()
-        pcm_data = await loop.run_in_executor(None, _convert_mp3_to_pcm, mp3_data)
+            # Collect MP3 for this sentence
+            mp3_chunks = []
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    mp3_chunks.append(chunk["data"])
 
-        # Step 3: Stream in fixed-size chunks for smooth playback
-        offset = 0
-        while offset < len(pcm_data):
-            chunk = pcm_data[offset:offset + TTS_CHUNK_BYTES]
-            yield chunk
-            offset += TTS_CHUNK_BYTES
+            if not mp3_chunks:
+                continue
+
+            mp3_data = b"".join(mp3_chunks)
+
+            # Convert and stream immediately
+            loop = asyncio.get_event_loop()
+            pcm_data = await loop.run_in_executor(None, _convert_mp3_to_pcm, mp3_data)
+
+            offset = 0
+            while offset < len(pcm_data):
+                chunk = pcm_data[offset:offset + TTS_CHUNK_BYTES]
+                yield chunk
+                offset += TTS_CHUNK_BYTES
 
     except Exception as e:
         logger.error(f"Error in TTS pipeline: {e}")
+
