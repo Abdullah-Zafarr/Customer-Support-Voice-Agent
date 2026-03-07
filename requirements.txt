@@ -10,3 +10,5 @@ httpx
 faster-whisper
 edge-tts
 numpy
+sentence-transformers
+PyMuPDF
